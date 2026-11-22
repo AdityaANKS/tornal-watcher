@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
+import { AnimatePresence, motion } from 'motion/react';
 import {
+  Activity,
   AlertTriangle,
   Loader2,
   Maximize,
@@ -21,18 +23,31 @@ import {
 import type {
   MediaProbeInfo,
   MediaSubtitleTrack,
+  PipelineSnapshot,
+  PlayerPlaybackTelemetry,
   TorrentFileItem,
   TranscodeQuality,
 } from '../types/torrent';
-import { convertSubtitleFile, saveWatchProgress } from '../api/client';
-import { formatDuration } from '../utils/torrentHelpers';
+import {
+  convertSubtitleFile,
+  postClientPipelineEvent,
+  saveWatchProgress,
+} from '../api/client';
+import {
+  computeBufferAhead,
+  formatBytes,
+  formatDuration,
+  resolveEffectiveDuration,
+} from '../utils/torrentHelpers';
 
 interface VideoPlayerProps {
   infoHash: string;
+  title: string;
   file: TorrentFileItem;
   isLocalSample: boolean;
   posterUrl?: string;
   probe: MediaProbeInfo | null;
+  pipeline: PipelineSnapshot | null;
   subtitles: MediaSubtitleTrack[];
   initialTime?: number;
   defaultQuality: TranscodeQuality;
@@ -41,6 +56,8 @@ interface VideoPlayerProps {
   theaterMode: boolean;
   externalSubId?: string | null;
   onActiveSubChange?: (subId: string) => void;
+  onTelemetryChange?: (telemetry: PlayerPlaybackTelemetry) => void;
+  onInspectPipeline?: () => void;
   onToggleTheater: () => void;
   onAddUploadedSubtitle: (track: MediaSubtitleTrack) => void;
 }
@@ -55,10 +72,12 @@ const QUALITY_OPTIONS: Array<{ value: TranscodeQuality; label: string }> = [
 
 export function VideoPlayer({
   infoHash,
+  title,
   file,
   isLocalSample,
   posterUrl,
   probe,
+  pipeline,
   subtitles,
   initialTime = 0,
   defaultQuality,
@@ -67,6 +86,8 @@ export function VideoPlayer({
   theaterMode,
   externalSubId,
   onActiveSubChange,
+  onTelemetryChange,
+  onInspectPipeline,
   onToggleTheater,
   onAddUploadedSubtitle,
 }: VideoPlayerProps) {
@@ -88,18 +109,22 @@ export function VideoPlayer({
   const [audioTrack, setAudioTrack] = useState<number>(0);
   const [activeSubId, setActiveSubId] = useState<string>('off');
   const [playbackRate, setPlaybackRate] = useState<number>(1);
+  const [seekOffset, setSeekOffset] = useState<number>(0);
 
   const [isPlaying, setIsPlaying] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
   const [isBuffering, setIsBuffering] = useState(true);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(probe?.duration || 0);
+  const [rawVideoTime, setRawVideoTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(probe?.duration || 0);
   const [bufferedEnd, setBufferedEnd] = useState(0);
+  const [bufferAheadSeconds, setBufferAheadSeconds] = useState(0);
   const [volume, setVolume] = useState(0.85);
   const [muted, setMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [openMenu, setOpenMenu] = useState<'none' | 'subtitles' | 'settings'>('none');
   const [activeCueLines, setActiveCueLines] = useState<string[]>([]);
+  const shouldResumeAfterSeekRef = useRef(false);
 
   const selectSubtitle = useCallback(
     (subId: string) => {
@@ -116,23 +141,28 @@ export function VideoPlayer({
     }
   }, [externalSubId]);
 
-  // Sync recommended mode when file or probe changes
+  // Reset engine & seek offset when switching torrent or file
   useEffect(() => {
     setEngineMode(recommendedEngine);
     setPlayerError(null);
     setAudioTrack(0);
+    setSeekOffset(0);
+    setRawVideoTime(0);
+    setHasStarted(false);
   }, [infoHash, file.index, recommendedEngine]);
 
   // Auto-select first subtitle if enabled
   useEffect(() => {
     if (autoSelectSubtitles && subtitles.length > 0) {
-      setActiveSubId((prev) => {
-        const next =
-          prev === 'off' || !subtitles.some((s) => s.id === prev) ? subtitles[0].id : prev;
-        onActiveSubChange?.(next);
-        return next;
-      });
-    } else if (!subtitles.some((s) => s.id === activeSubId)) {
+      const next =
+        activeSubId === 'off' || !subtitles.some((s) => s.id === activeSubId)
+          ? subtitles[0].id
+          : activeSubId;
+      if (next !== activeSubId) {
+        setActiveSubId(next);
+      }
+      onActiveSubChange?.(next);
+    } else if (activeSubId !== 'off' && !subtitles.some((s) => s.id === activeSubId)) {
       setActiveSubId('off');
       onActiveSubChange?.('off');
     }
@@ -143,20 +173,66 @@ export function VideoPlayer({
     if (engineMode === 'direct') {
       return {
         type: 'native' as const,
+        isLiveFragmented: false,
+        transportLabel: 'HTTP 206 Range' as const,
         url: `/api/stream/${encodeURIComponent(infoHash)}/${file.index}`,
       };
     }
     if (isLocalSample) {
       return {
         type: 'hls' as const,
+        isLiveFragmented: false,
+        transportLabel: 'FFmpeg HLS' as const,
         url: `/api/hls/${encodeURIComponent(infoHash)}/${file.index}/${quality}/${audioTrack}/index.m3u8`,
       };
     }
     return {
       type: 'native' as const,
-      url: `/api/transcode/${encodeURIComponent(infoHash)}/${file.index}/stream.mp4?quality=${quality}&audioTrack=${audioTrack}`,
+      isLiveFragmented: true,
+      transportLabel: 'FFmpeg Live fMP4' as const,
+      url: `/api/transcode/${encodeURIComponent(infoHash)}/${file.index}/stream.mp4?quality=${quality}&audioTrack=${audioTrack}&start=${Math.floor(seekOffset)}`,
     };
-  }, [engineMode, infoHash, file.index, isLocalSample, quality, audioTrack]);
+  }, [engineMode, infoHash, file.index, isLocalSample, quality, audioTrack, seekOffset]);
+
+  const displayedCurrentTime = streamSource.isLiveFragmented
+    ? seekOffset + rawVideoTime
+    : rawVideoTime;
+  const effectiveDuration = resolveEffectiveDuration(
+    videoDuration,
+    probe?.duration ?? 0,
+    streamSource.isLiveFragmented
+  );
+
+  // Report live playback telemetry upward to PlayerWorkspace & StreamPipelineDrawer
+  useEffect(() => {
+    onTelemetryChange?.({
+      isPlaying,
+      isBuffering,
+      hasStarted,
+      currentTime: displayedCurrentTime,
+      duration: effectiveDuration,
+      bufferAheadSeconds,
+      bufferedEndSeconds: streamSource.isLiveFragmented ? seekOffset + bufferedEnd : bufferedEnd,
+      engineMode,
+      transportLabel: streamSource.transportLabel,
+      quality,
+      seekOffset,
+    });
+  }, [
+    isPlaying,
+    isBuffering,
+    hasStarted,
+    displayedCurrentTime,
+    effectiveDuration,
+    bufferAheadSeconds,
+    bufferedEnd,
+    engineMode,
+    streamSource.transportLabel,
+    streamSource.isLiveFragmented,
+    quality,
+    seekOffset,
+    onTelemetryChange,
+  ]);
 
   // Attach source (Native MP4 or hls.js)
   useEffect(() => {
@@ -171,7 +247,13 @@ export function VideoPlayer({
       hlsRef.current = null;
     }
 
-    const resumePos = currentTime > 1 ? currentTime : initialTime > 1 ? initialTime : 0;
+    const resumePos = !streamSource.isLiveFragmented
+      ? displayedCurrentTime > 1
+        ? displayedCurrentTime
+        : initialTime > 1
+          ? initialTime
+          : 0
+      : 0;
 
     if (streamSource.type === 'hls' && Hls.isSupported()) {
       const hls = new Hls({
@@ -191,25 +273,26 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
-          // Graceful fallback to live fragmented MP4 transcode stream
           hls.destroy();
           hlsRef.current = null;
-          video.src = `/api/transcode/${encodeURIComponent(infoHash)}/${file.index}/stream.mp4?quality=${quality}&audioTrack=${audioTrack}`;
+          video.src = `/api/transcode/${encodeURIComponent(infoHash)}/${file.index}/stream.mp4?quality=${quality}&audioTrack=${audioTrack}&start=${Math.floor(seekOffset)}`;
           video.load();
         }
       });
     } else {
       video.src = streamSource.url;
       video.load();
-      if (resumePos > 0) {
-        const applyResume = () => {
-          if (video.duration && resumePos < video.duration - 1) {
-            video.currentTime = resumePos;
-          }
-          video.removeEventListener('loadedmetadata', applyResume);
-        };
-        video.addEventListener('loadedmetadata', applyResume);
-      }
+      const handleReady = () => {
+        if (resumePos > 0 && Number.isFinite(video.duration) && resumePos < video.duration - 1) {
+          video.currentTime = resumePos;
+        }
+        if (shouldResumeAfterSeekRef.current) {
+          shouldResumeAfterSeekRef.current = false;
+          void video.play().catch(() => {});
+        }
+        video.removeEventListener('loadedmetadata', handleReady);
+      };
+      video.addEventListener('loadedmetadata', handleReady);
     }
 
     return () => {
@@ -298,14 +381,35 @@ export function VideoPlayer({
     }
   }, []);
 
-  const seekBy = useCallback((deltaSeconds: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    const total = Number.isFinite(video.duration) ? video.duration : duration;
-    const next = Math.max(0, Math.min(total || 0, video.currentTime + deltaSeconds));
-    video.currentTime = next;
-    setCurrentTime(next);
-  }, [duration]);
+  const seekToTime = useCallback(
+    (targetSeconds: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const clamped = Math.max(0, Math.min(effectiveDuration || 0, targetSeconds));
+
+      if (streamSource.isLiveFragmented) {
+        shouldResumeAfterSeekRef.current = !video.paused;
+        setRawVideoTime(0);
+        setSeekOffset(Math.floor(clamped));
+        void postClientPipelineEvent(
+          infoHash,
+          `Seeked live stream to ${formatDuration(clamped)}`,
+          `Restarting FFmpeg at ${Math.floor(clamped)}s`
+        );
+      } else {
+        video.currentTime = clamped;
+        setRawVideoTime(clamped);
+      }
+    },
+    [effectiveDuration, streamSource.isLiveFragmented, infoHash]
+  );
+
+  const seekBy = useCallback(
+    (deltaSeconds: number) => {
+      seekToTime(displayedCurrentTime + deltaSeconds);
+    },
+    [seekToTime, displayedCurrentTime]
+  );
 
   const toggleFullscreen = useCallback(() => {
     const el = containerRef.current;
@@ -399,10 +503,12 @@ export function VideoPlayer({
     }
   };
 
-  const effectiveDuration = duration || probe?.duration || 0;
-  const playedPct = effectiveDuration > 0 ? Math.min(100, (currentTime / effectiveDuration) * 100) : 0;
+  const playedPct =
+    effectiveDuration > 0 ? Math.min(100, (displayedCurrentTime / effectiveDuration) * 100) : 0;
+  const totalBufferedPos = streamSource.isLiveFragmented ? seekOffset + bufferedEnd : bufferedEnd;
   const bufferedPct =
-    effectiveDuration > 0 ? Math.min(100, (bufferedEnd / effectiveDuration) * 100) : 0;
+    effectiveDuration > 0 ? Math.min(100, (totalBufferedPos / effectiveDuration) * 100) : 0;
+  const serverCachePct = pipeline?.cachePercent ?? (isLocalSample ? 100 : 0);
 
   return (
     <div
@@ -426,35 +532,57 @@ export function VideoPlayer({
           onLoadedMetadata={(e) => {
             const v = e.currentTarget;
             if (Number.isFinite(v.duration) && v.duration > 0) {
-              setDuration(v.duration);
+              setVideoDuration(v.duration);
             }
             setIsBuffering(false);
+          }}
+          onDurationChange={(e) => {
+            const v = e.currentTarget;
+            if (Number.isFinite(v.duration) && v.duration > 0) {
+              setVideoDuration(v.duration);
+            }
           }}
           onCanPlay={() => setIsBuffering(false)}
           onWaiting={() => setIsBuffering(true)}
           onPlaying={() => {
             setIsPlaying(true);
+            setHasStarted(true);
             setIsBuffering(false);
+            void postClientPipelineEvent(
+              infoHash,
+              `Playing at ${formatDuration(displayedCurrentTime)}`,
+              `${streamSource.transportLabel} · +${bufferAheadSeconds.toFixed(1)}s buffered`
+            );
           }}
           onPause={() => {
             setIsPlaying(false);
             if (videoRef.current) {
-              void saveWatchProgress(
+              const absolutePos = streamSource.isLiveFragmented
+                ? seekOffset + videoRef.current.currentTime
+                : videoRef.current.currentTime;
+              void saveWatchProgress(infoHash, file.index, absolutePos, effectiveDuration);
+              void postClientPipelineEvent(
                 infoHash,
-                file.index,
-                videoRef.current.currentTime,
-                effectiveDuration
+                `Paused at ${formatDuration(absolutePos)} / ${formatDuration(effectiveDuration)}`,
+                `Server cache ${serverCachePct}% · browser buffer +${bufferAheadSeconds.toFixed(1)}s`
               );
             }
           }}
           onEnded={() => setIsPlaying(false)}
           onTimeUpdate={(e) => {
             const v = e.currentTarget;
-            setCurrentTime(v.currentTime);
-            if (v.buffered.length > 0) {
-              setBufferedEnd(v.buffered.end(v.buffered.length - 1));
+            setRawVideoTime(v.currentTime);
+            const ranges: Array<{ start: number; end: number }> = [];
+            for (let i = 0; i < v.buffered.length; i++) {
+              ranges.push({ start: v.buffered.start(i), end: v.buffered.end(i) });
             }
-            persistProgress(v.currentTime, effectiveDuration);
+            const buf = computeBufferAhead(v.currentTime, ranges);
+            setBufferedEnd(buf.bufferedEnd);
+            setBufferAheadSeconds(buf.aheadSeconds);
+            const absolutePos = streamSource.isLiveFragmented
+              ? seekOffset + v.currentTime
+              : v.currentTime;
+            persistProgress(absolutePos, effectiveDuration);
           }}
           onError={() => {
             setIsBuffering(false);
@@ -479,6 +607,52 @@ export function VideoPlayer({
             />
           ))}
         </video>
+
+        {/* Animated Pause Info Overlay HUD */}
+        <AnimatePresence>
+          {!isPlaying && !isBuffering && !playerError && hasStarted && (
+            <motion.div
+              key="pause-info-hud"
+              data-testid="pause-info-overlay"
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+              className="pointer-events-auto absolute top-4 left-4 right-4 z-20 flex flex-wrap items-start justify-between gap-3 rounded-xl border border-white/10 bg-[#0B0D12]/88 p-3.5 backdrop-blur-md sm:right-auto sm:max-w-md sm:p-4"
+            >
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex items-center gap-2 text-[11px] font-semibold tracking-wide text-[#FDA4AF]">
+                  <span>Paused</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono tabular-nums text-[#E2E8F0]">
+                    {formatDuration(displayedCurrentTime)} / {formatDuration(effectiveDuration)}
+                  </span>
+                </div>
+                <p className="truncate text-sm font-semibold text-white">{title}</p>
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] tabular-nums text-[#94A3B8]">
+                  <span>
+                    Server cache {serverCachePct}%
+                    {pipeline ? ` (${formatBytes(pipeline.cacheBytes)})` : ''}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>Buffer +{bufferAheadSeconds.toFixed(1)}s</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{streamSource.transportLabel}</span>
+                </div>
+                {onInspectPipeline && (
+                  <button
+                    type="button"
+                    onClick={onInspectPipeline}
+                    className="mt-1 inline-flex items-center gap-1.5 text-xs font-medium text-[#FDA4AF] transition-colors hover:text-white"
+                  >
+                    <Activity className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Inspect live server pipeline</span>
+                  </button>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Dedicated Cinema Subtitle Overlay — positioned cleanly above bottom control bar */}
         {activeCueLines.length > 0 && activeSubId !== 'off' && (
@@ -544,13 +718,20 @@ export function VideoPlayer({
 
         {/* Bottom Scrim & Custom Control Bar */}
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/95 via-black/70 to-transparent px-3 pt-10 pb-3 sm:px-4">
-          {/* Interactive Timeline Scrubber */}
+          {/* Interactive 3-Layer Timeline Scrubber (Server Cache + Browser Buffer + Playhead) */}
           <div className="relative mb-2.5 flex items-center">
-            <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/20">
+            <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/15">
+              {/* Layer 1: Server Disk Cache */}
               <div
-                className="absolute inset-y-0 left-0 bg-white/35 transition-all duration-150"
+                className="absolute inset-y-0 left-0 bg-slate-400/30 transition-all duration-300"
+                style={{ width: `${serverCachePct}%` }}
+              />
+              {/* Layer 2: Browser Buffered */}
+              <div
+                className="absolute inset-y-0 left-0 bg-white/45 transition-all duration-150"
                 style={{ width: `${bufferedPct}%` }}
               />
+              {/* Layer 3: Playhead */}
               <div
                 className="absolute inset-y-0 left-0 bg-[#E11D48]"
                 style={{ width: `${playedPct}%` }}
@@ -561,15 +742,9 @@ export function VideoPlayer({
               aria-label="Seek timeline"
               min={0}
               max={effectiveDuration || 100}
-              step={0.1}
-              value={Math.min(currentTime, effectiveDuration || 100)}
-              onChange={(e) => {
-                const next = Number(e.target.value);
-                setCurrentTime(next);
-                if (videoRef.current) {
-                  videoRef.current.currentTime = next;
-                }
-              }}
+              step={0.5}
+              value={Math.min(displayedCurrentTime, effectiveDuration || 100)}
+              onChange={(e) => seekToTime(Number(e.target.value))}
               className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
             />
           </div>
@@ -644,7 +819,7 @@ export function VideoPlayer({
                 data-testid="player-timecode"
                 className="ml-1 font-mono text-xs tabular-nums text-[#E2E8F0] whitespace-nowrap"
               >
-                {formatDuration(currentTime)} / {formatDuration(effectiveDuration)}
+                {formatDuration(displayedCurrentTime)} / {formatDuration(effectiveDuration)}
               </span>
             </div>
 

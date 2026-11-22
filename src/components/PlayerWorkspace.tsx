@@ -18,11 +18,13 @@ import type {
   FileTreeNode,
   MediaProbeInfo,
   MediaSubtitleTrack,
+  PipelineSnapshot,
+  PlayerPlaybackTelemetry,
   ServerSettings,
   TorrentFileItem,
   TorrentSummary,
 } from '../types/torrent';
-import { probeMediaFile } from '../api/client';
+import { fetchPipelineSnapshot, probeMediaFile } from '../api/client';
 import {
   buildFileTree,
   extractReleaseMeta,
@@ -32,6 +34,7 @@ import {
   pickPrimaryVideoFile,
 } from '../utils/torrentHelpers';
 import { VideoPlayer } from './VideoPlayer';
+import { StreamPipelineDrawer } from './StreamPipelineDrawer';
 
 interface PlayerWorkspaceProps {
   torrent: TorrentSummary;
@@ -144,6 +147,21 @@ export function PlayerWorkspace({
   const primaryVideo = useMemo(() => pickPrimaryVideoFile(torrent.files), [torrent.files]);
   const [selectedFileIndex, setSelectedFileIndex] = useState<number>(primaryVideo?.index ?? 0);
   const [probe, setProbe] = useState<MediaProbeInfo | null>(null);
+  const [pipeline, setPipeline] = useState<PipelineSnapshot | null>(null);
+  const [pipelineOpen, setPipelineOpen] = useState(false);
+  const [telemetry, setTelemetry] = useState<PlayerPlaybackTelemetry>({
+    isPlaying: false,
+    isBuffering: false,
+    hasStarted: false,
+    currentTime: 0,
+    duration: 0,
+    bufferAheadSeconds: 0,
+    bufferedEndSeconds: 0,
+    engineMode: 'direct',
+    transportLabel: 'HTTP 206 Range',
+    quality: settings.transcodeQuality,
+    seekOffset: 0,
+  });
   const [uploadedSubs, setUploadedSubs] = useState<MediaSubtitleTrack[]>([]);
   const [activeSubId, setActiveSubId] = useState<string>('off');
   const [externalSubId, setExternalSubId] = useState<string | null>(null);
@@ -167,23 +185,54 @@ export function PlayerWorkspace({
     [torrent.files, selectedFileIndex, primaryVideo]
   );
 
-  // Probe active file via ffprobe on backend
+  // Poll live Server Cache, Piece Map & Pipeline Activity every 2 seconds
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      fetchPipelineSnapshot(torrent.infoHash)
+        .then((snap) => {
+          if (!cancelled) setPipeline(snap);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [torrent.infoHash]);
+
+  // Probe active file via ffprobe on backend — retry once after 4s if live torrent duration wasn't ready yet
   useEffect(() => {
     if (!activeFile || activeFile.kind !== 'video') {
       setProbe(null);
       return;
     }
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     setProbe(null);
-    probeMediaFile(torrent.infoHash, activeFile.index)
-      .then((info) => {
-        if (!cancelled) setProbe(info);
-      })
-      .catch(() => {
-        if (!cancelled) setProbe(null);
-      });
+
+    const runProbe = (attempt: number) => {
+      probeMediaFile(torrent.infoHash, activeFile.index)
+        .then((info) => {
+          if (cancelled) return;
+          setProbe(info);
+          if (info.duration === 0 && attempt < 3) {
+            retryTimer = setTimeout(() => runProbe(attempt + 1), 4000);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && attempt < 2) {
+            retryTimer = setTimeout(() => runProbe(attempt + 1), 4000);
+          }
+        });
+    };
+
+    runProbe(0);
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [torrent.infoHash, activeFile?.index, activeFile?.kind]);
 
@@ -376,10 +425,12 @@ export function PlayerWorkspace({
           {activeFile ? (
             <VideoPlayer
               infoHash={torrent.infoHash}
+              title={releaseMeta?.cleanTitle || torrent.name}
               file={activeFile}
               isLocalSample={torrent.source === 'local-sample'}
               posterUrl={torrent.posterUrl}
               probe={probe}
+              pipeline={pipeline}
               subtitles={availableSubtitles}
               initialTime={savedProgress?.currentTime ?? 0}
               defaultQuality={settings.transcodeQuality}
@@ -391,6 +442,8 @@ export function PlayerWorkspace({
                 setActiveSubId(id);
                 setExternalSubId(null);
               }}
+              onTelemetryChange={setTelemetry}
+              onInspectPipeline={() => setPipelineOpen(true)}
               onToggleTheater={() => setTheaterMode((t) => !t)}
               onAddUploadedSubtitle={(track) => setUploadedSubs((prev) => [...prev, track])}
             />
@@ -415,6 +468,16 @@ export function PlayerWorkspace({
             </div>
           )}
 
+          {/* Animated Expandable Server <-> Website <-> User Pipeline & Cache Dropdown */}
+          <StreamPipelineDrawer
+            open={pipelineOpen}
+            onToggle={() => setPipelineOpen((prev) => !prev)}
+            torrent={torrent}
+            pipeline={pipeline}
+            probe={probe}
+            telemetry={telemetry}
+          />
+
           {/* Live Swarm & Technical Media Telemetry Bar */}
           <div className="grid grid-cols-2 gap-4 rounded-xl border border-[#1E2432] bg-[#121620] p-4 sm:grid-cols-4">
             <div>
@@ -432,9 +495,10 @@ export function PlayerWorkspace({
               </p>
             </div>
             <div>
-              <p className="text-xs text-[#64748B]">Buffered / Size</p>
+              <p className="text-xs text-[#64748B]">Server Cache / Size</p>
               <p className="mt-1 font-mono text-sm font-medium tabular-nums text-white">
-                {Math.round(torrent.progress * 100)}% · {formatBytes(torrent.totalLength)}
+                {pipeline?.cachePercent ?? Math.round(torrent.progress * 100)}% ·{' '}
+                {formatBytes(torrent.totalLength)}
               </p>
             </div>
             <div>

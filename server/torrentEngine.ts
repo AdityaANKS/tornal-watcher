@@ -4,12 +4,18 @@ import type { Readable } from 'node:stream';
 import torrentStream from 'torrent-stream';
 import parseTorrent from 'parse-torrent';
 import {
+  buildPieceMapBuckets,
   classifyMediaFile,
   convertSrtToVtt,
+  formatBytes,
+  formatDuration,
   parseMagnetOrHash,
 } from '../src/utils/torrentHelpers.ts';
 import type {
+  ActiveTranscodeInfo,
   MediaProbeInfo,
+  PipelineEvent,
+  PipelineSnapshot,
   TorrentFileItem,
   TorrentStatus,
   TorrentSummary,
@@ -20,7 +26,7 @@ import {
   getSampleDescriptors,
   type LocalSampleTorrent,
 } from './sampleGenerator.ts';
-import { probeLocalFile } from './transcoder.ts';
+import { probeMediaSource } from './transcoder.ts';
 
 interface TorrentStreamFile {
   name: string;
@@ -38,6 +44,10 @@ interface TorrentStreamEngine {
     length?: number;
     pieceLength?: number;
     pieces?: string[];
+  };
+  bitfield?: {
+    get: (index: number) => boolean;
+    buffer?: Buffer;
   };
   files: TorrentStreamFile[];
   swarm: {
@@ -68,6 +78,10 @@ interface ManagedTorrentEntry {
   engine?: TorrentStreamEngine;
   parsedFiles?: Array<{ name: string; path: string; length: number }>;
   localSample?: LocalSampleTorrent;
+  activeHttpStreams: number;
+  lastRangeBytes: string | null;
+  transcode: ActiveTranscodeInfo;
+  events: PipelineEvent[];
 }
 
 export interface StreamableFileHandle {
@@ -81,12 +95,75 @@ export interface StreamableFileHandle {
 
 export class TorrentManager {
   private entries = new Map<string, ManagedTorrentEntry>();
+  private probeCache = new Map<string, MediaProbeInfo>();
+  private probeInFlight = new Map<string, Promise<MediaProbeInfo | null>>();
   private store: LibraryStore;
 
   constructor(store: LibraryStore) {
     this.store = store;
     this.registerLocalSamples();
     this.restorePersistedTorrents();
+  }
+
+  private defaultTranscodeState(): ActiveTranscodeInfo {
+    return {
+      active: false,
+      quality: '720p',
+      startSeconds: 0,
+      fps: 0,
+      speed: '0x',
+      encodedSeconds: 0,
+    };
+  }
+
+  recordEvent(
+    infoHash: string,
+    stage: PipelineEvent['stage'],
+    message: string,
+    detail?: string
+  ): void {
+    const entry = this.entries.get(infoHash.toLowerCase());
+    if (!entry) return;
+    const evt: PipelineEvent = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: new Date().toISOString(),
+      stage,
+      message,
+      detail,
+    };
+    entry.events.unshift(evt);
+    if (entry.events.length > 24) {
+      entry.events.length = 24;
+    }
+  }
+
+  trackHttpStream(infoHash: string, rangeLabel: string, isInternalFfmpeg = false): () => void {
+    const entry = this.entries.get(infoHash.toLowerCase());
+    if (!entry) return () => {};
+    if (!isInternalFfmpeg) {
+      entry.activeHttpStreams += 1;
+      entry.lastRangeBytes = rangeLabel;
+      this.recordEvent(
+        infoHash,
+        'browser',
+        `HTTP 206 byte range requested`,
+        rangeLabel
+      );
+    }
+    let closed = false;
+    return () => {
+      if (closed) return;
+      closed = true;
+      if (!isInternalFfmpeg) {
+        entry.activeHttpStreams = Math.max(0, entry.activeHttpStreams - 1);
+      }
+    };
+  }
+
+  updateTranscodeTelemetry(infoHash: string, patch: Partial<ActiveTranscodeInfo>): void {
+    const entry = this.entries.get(infoHash.toLowerCase());
+    if (!entry) return;
+    entry.transcode = { ...entry.transcode, ...patch };
   }
 
   private registerLocalSamples(): void {
@@ -104,6 +181,18 @@ export class TorrentManager {
         addedAt: sample.addedAt,
         paused: false,
         localSample: sample,
+        activeHttpStreams: 0,
+        lastRangeBytes: null,
+        transcode: this.defaultTranscodeState(),
+        events: [
+          {
+            id: `init-${hash.slice(0, 8)}`,
+            timestamp: new Date().toISOString(),
+            stage: 'server',
+            message: 'Media cached on private server disk',
+            detail: '100% verified · ready for instant HTTP 206 or FFmpeg streaming',
+          },
+        ],
       });
 
       if (!this.store.getRecord(hash)) {
@@ -143,6 +232,18 @@ export class TorrentManager {
         trackers: parsed.trackers,
         addedAt: rec.addedAt,
         paused: true,
+        activeHttpStreams: 0,
+        lastRangeBytes: null,
+        transcode: this.defaultTranscodeState(),
+        events: [
+          {
+            id: `restore-${hash.slice(0, 8)}`,
+            timestamp: new Date().toISOString(),
+            stage: 'server',
+            message: 'Restored saved torrent from private library',
+            detail: 'Paused until playback starts',
+          },
+        ],
       };
       this.entries.set(hash, entry);
     }
@@ -174,22 +275,36 @@ export class TorrentManager {
     entry.status = 'connecting';
     entry.paused = false;
 
+    this.recordEvent(
+      entry.infoHash,
+      'swarm',
+      'Announcing to DHT and BitTorrent trackers',
+      `${entry.trackers.length} trackers configured`
+    );
+
     engine.on('ready', () => {
       if (engine.torrent?.name) {
         entry.name = engine.torrent.name;
       }
       entry.status = 'downloading';
-      // Deselect everything initially; prioritize video files on stream request
       for (const file of engine.files) {
         file.deselect();
       }
-      // Prioritize the largest video file so playback starts rapidly
       const videoFiles = engine.files
         .filter((f) => classifyMediaFile(f.name).kind === 'video')
         .sort((a, b) => b.length - a.length);
       if (videoFiles[0]) {
         videoFiles[0].select();
       }
+
+      const totalSize = engine.files.reduce((s, f) => s + f.length, 0);
+      this.recordEvent(
+        entry.infoHash,
+        'swarm',
+        `Metadata received (${engine.files.length} files)`,
+        `${formatBytes(totalSize)} · prioritizing sequential video header pieces`
+      );
+
       this.store.upsertRecord({
         infoHash: entry.infoHash,
         name: entry.name,
@@ -203,6 +318,12 @@ export class TorrentManager {
     engine.on('idle', () => {
       if (!entry.paused) {
         entry.status = settings.seedAfterComplete ? 'seeding' : 'ready';
+        this.recordEvent(
+          entry.infoHash,
+          'server',
+          'All prioritized video pieces cached to server disk',
+          settings.seedAfterComplete ? 'Seeding enabled' : 'Ready for instant local seeking'
+        );
       }
     });
   }
@@ -231,6 +352,10 @@ export class TorrentManager {
       trackers: parsed.trackers,
       addedAt: now,
       paused: false,
+      activeHttpStreams: 0,
+      lastRangeBytes: null,
+      transcode: this.defaultTranscodeState(),
+      events: [],
     };
 
     this.entries.set(parsed.infoHash, entry);
@@ -289,6 +414,10 @@ export class TorrentManager {
         path: f.path,
         length: f.length,
       })),
+      activeHttpStreams: 0,
+      lastRangeBytes: null,
+      transcode: this.defaultTranscodeState(),
+      events: [],
     };
 
     this.entries.set(infoHash, entry);
@@ -450,34 +579,134 @@ export class TorrentManager {
   }
 
   async probeFile(infoHash: string, fileIndex: number): Promise<MediaProbeInfo | null> {
-    const handle = await this.resolveFileHandle(infoHash, fileIndex);
-    if (!handle) return null;
-
-    if (handle.localFilePath) {
-      return probeLocalFile(handle.localFilePath, infoHash, fileIndex);
+    const cacheKey = `${infoHash.toLowerCase()}:${fileIndex}`;
+    const cached = this.probeCache.get(cacheKey);
+    if (cached && cached.duration > 0) {
+      return cached;
     }
 
+    const inFlight = this.probeInFlight.get(cacheKey);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const job = (async (): Promise<MediaProbeInfo | null> => {
+      const handle = await this.resolveFileHandle(infoHash, fileIndex);
+      if (!handle) return null;
+
+      try {
+        // Probe local file directly if fully cached, otherwise probe via local HTTP Range stream
+        // so ffprobe reads MKV/MP4 headers and discovers the true full duration (e.g. 24:00) immediately!
+        const source =
+          handle.localFilePath ||
+          `http://127.0.0.1:3000/api/stream/${encodeURIComponent(infoHash)}/${fileIndex}`;
+        const info = await probeMediaSource(source, handle.name, infoHash, fileIndex);
+        if (info.duration > 0) {
+          this.probeCache.set(cacheKey, info);
+          this.recordEvent(
+            infoHash,
+            'server',
+            `Container inspected (${formatDuration(info.duration)} · ${info.width}×${info.height} ${info.videoCodec})`,
+            `${info.audioTracks.length} audio · ${info.recommendedMode === 'transcode' ? 'FFmpeg transcode recommended' : 'Browser native Direct Play'}`
+          );
+        }
+        return info;
+      } catch {
+        return {
+          duration: 0,
+          formatName: handle.name.split('.').pop()?.toLowerCase() || 'stream',
+          bitRate: 0,
+          videoCodec: handle.needsTranscode ? 'TRANSCODE' : 'H264',
+          width: 0,
+          height: 0,
+          fps: '24',
+          audioTracks: [
+            {
+              index: 0,
+              streamIndex: 1,
+              codec: 'AAC',
+              language: 'Default',
+              title: 'Primary Audio Track',
+              channels: 2,
+            },
+          ],
+          embeddedSubtitles: [],
+          browserCompatible: !handle.needsTranscode,
+          recommendedMode: handle.needsTranscode ? 'transcode' : 'direct',
+        };
+      }
+    })();
+
+    this.probeInFlight.set(cacheKey, job);
+    try {
+      return await job;
+    } finally {
+      this.probeInFlight.delete(cacheKey);
+    }
+  }
+
+  getPipelineSnapshot(infoHash: string): PipelineSnapshot | null {
+    const entry = this.entries.get(infoHash.toLowerCase());
+    if (!entry) return null;
+
+    const summary = this.toSummary(entry);
+
+    if (entry.localSample) {
+      const totalBytes = summary.totalLength;
+      return {
+        infoHash: entry.infoHash,
+        cacheBytes: totalBytes,
+        totalBytes,
+        cachePercent: 100,
+        verifiedPieces: 48,
+        totalPieces: 48,
+        pieceLength: Math.max(1, Math.round(totalBytes / 48)),
+        pieceBuckets: new Array<number>(48).fill(1),
+        activeHttpStreams: entry.activeHttpStreams,
+        lastRangeBytes: entry.lastRangeBytes,
+        transcode: { ...entry.transcode },
+        events: [...entry.events],
+      };
+    }
+
+    const engine = entry.engine;
+    const totalPieces = engine?.torrent?.pieces?.length ?? 0;
+    const pieceLength = engine?.torrent?.pieceLength ?? 0;
+    let verifiedPieces = 0;
+    let pieceBuckets: number[] = new Array<number>(48).fill(0);
+
+    if (engine?.bitfield && totalPieces > 0) {
+      const flags: boolean[] = new Array<boolean>(totalPieces);
+      for (let i = 0; i < totalPieces; i++) {
+        const has = Boolean(engine.bitfield.get(i));
+        flags[i] = has;
+        if (has) verifiedPieces++;
+      }
+      pieceBuckets = buildPieceMapBuckets(flags, 48);
+    }
+
+    const totalBytes = summary.totalLength;
+    const pieceBasedBytes = verifiedPieces * pieceLength;
+    const cacheBytes =
+      totalBytes > 0
+        ? Math.min(totalBytes, Math.max(summary.downloaded, pieceBasedBytes))
+        : summary.downloaded;
+    const cachePercent =
+      totalBytes > 0 ? Number(((cacheBytes / totalBytes) * 100).toFixed(1)) : 0;
+
     return {
-      duration: 0,
-      formatName: handle.name.split('.').pop()?.toLowerCase() || 'stream',
-      bitRate: 0,
-      videoCodec: handle.needsTranscode ? 'TRANSCODE' : 'H264',
-      width: 0,
-      height: 0,
-      fps: '24',
-      audioTracks: [
-        {
-          index: 0,
-          streamIndex: 1,
-          codec: 'AAC',
-          language: 'Default',
-          title: 'Primary Audio Track',
-          channels: 2,
-        },
-      ],
-      embeddedSubtitles: [],
-      browserCompatible: !handle.needsTranscode,
-      recommendedMode: handle.needsTranscode ? 'transcode' : 'direct',
+      infoHash: entry.infoHash,
+      cacheBytes,
+      totalBytes,
+      cachePercent,
+      verifiedPieces,
+      totalPieces,
+      pieceLength,
+      pieceBuckets,
+      activeHttpStreams: entry.activeHttpStreams,
+      lastRangeBytes: entry.lastRangeBytes,
+      transcode: { ...entry.transcode },
+      events: [...entry.events],
     };
   }
 

@@ -1,5 +1,6 @@
 import type {
   MediaProbeInfo,
+  PipelineSnapshot,
   ServerSettings,
   TorrentSummary,
 } from '../types/torrent';
@@ -25,6 +26,23 @@ export async function fetchTorrents(): Promise<TorrentSummary[]> {
 export async function fetchTorrent(infoHash: string): Promise<TorrentSummary> {
   const res = await fetch(`/api/torrents/${encodeURIComponent(infoHash)}`);
   return parseJson<TorrentSummary>(res);
+}
+
+export async function fetchPipelineSnapshot(infoHash: string): Promise<PipelineSnapshot> {
+  const res = await fetch(`/api/torrents/${encodeURIComponent(infoHash)}/pipeline`);
+  return parseJson<PipelineSnapshot>(res);
+}
+
+export async function postClientPipelineEvent(
+  infoHash: string,
+  message: string,
+  detail?: string
+): Promise<void> {
+  await fetch(`/api/torrents/${encodeURIComponent(infoHash)}/client-event`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, detail }),
+  }).catch(() => {});
 }
 
 export async function addMagnetTorrent(magnet: string): Promise<TorrentSummary> {

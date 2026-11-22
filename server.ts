@@ -11,7 +11,7 @@ import {
   extractEmbeddedSubtitleVtt,
   streamTranscodedMp4,
 } from './server/transcoder.ts';
-import { convertSrtToVtt } from './src/utils/torrentHelpers.ts';
+import { convertSrtToVtt, formatBytes, formatDuration } from './src/utils/torrentHelpers.ts';
 import type { TranscodeQuality } from './src/types/torrent.ts';
 
 const PORT = 3000;
@@ -74,6 +74,26 @@ async function bootstrap() {
       return;
     }
     res.json(torrent);
+  });
+
+  // Live Server Cache, Piece Map & Pipeline Activity Snapshot
+  app.get('/api/torrents/:infoHash/pipeline', (req, res) => {
+    const snapshot = torrentManager.getPipelineSnapshot(req.params.infoHash);
+    if (!snapshot) {
+      res.status(404).json({ error: 'Torrent not found on this server.' });
+      return;
+    }
+    res.json(snapshot);
+  });
+
+  // Record Browser Playback Lifecycle Event (pause/resume/seek) into Pipeline Feed
+  app.post('/api/torrents/:infoHash/client-event', (req, res) => {
+    const message = typeof req.body?.message === 'string' ? req.body.message.slice(0, 140) : '';
+    const detail = typeof req.body?.detail === 'string' ? req.body.detail.slice(0, 160) : undefined;
+    if (message) {
+      torrentManager.recordEvent(req.params.infoHash, 'browser', message, detail);
+    }
+    res.json({ ok: true });
   });
 
   // Add Magnet / InfoHash
@@ -184,6 +204,8 @@ async function bootstrap() {
       const fileSize = handle.length;
       const rangeHeader = req.headers.range;
       const download = req.query.download === '1';
+      const userAgent = String(req.headers['user-agent'] || '');
+      const isInternalFfmpeg = userAgent.startsWith('Lavf/');
 
       if (download) {
         res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(handle.name)}"`);
@@ -211,12 +233,21 @@ async function bootstrap() {
         res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
         res.setHeader('Content-Length', String(chunkSize));
 
+        const releaseStream = torrentManager.trackHttpStream(
+          req.params.infoHash,
+          `${formatBytes(start)} – ${formatBytes(end)}`,
+          isInternalFfmpeg
+        );
+
         const stream = handle.createReadStream({ start, end });
         stream.on('error', () => {
+          releaseStream();
           if (!res.headersSent) res.status(500).end();
           else res.end();
         });
+        stream.on('end', releaseStream);
         req.on('close', () => {
+          releaseStream();
           if ('destroy' in stream && typeof stream.destroy === 'function') {
             stream.destroy();
           }
@@ -225,12 +256,20 @@ async function bootstrap() {
       } else {
         res.status(200);
         res.setHeader('Content-Length', String(fileSize));
+        const releaseStream = torrentManager.trackHttpStream(
+          req.params.infoHash,
+          `0 B – ${formatBytes(fileSize)}`,
+          isInternalFfmpeg
+        );
         const stream = handle.createReadStream();
         stream.on('error', () => {
+          releaseStream();
           if (!res.headersSent) res.status(500).end();
           else res.end();
         });
+        stream.on('end', releaseStream);
         req.on('close', () => {
+          releaseStream();
           if ('destroy' in stream && typeof stream.destroy === 'function') {
             stream.destroy();
           }
@@ -246,7 +285,7 @@ async function bootstrap() {
     }
   });
 
-  // On-the-Fly FFmpeg Fragmented MP4 Transcode Stream (Works on live torrents & MKV/AVI/HEVC)
+  // On-the-Fly FFmpeg Fragmented MP4 Transcode Stream (Works on live torrents & MKV/AVI/HEVC with seeking)
   app.get('/api/transcode/:infoHash/:fileIndex/stream.mp4', async (req, res) => {
     try {
       if (!ffmpegAvailable) {
@@ -264,15 +303,48 @@ async function bootstrap() {
       const quality = (String(req.query.quality || '720p') as TranscodeQuality);
       const startSeconds = Math.max(0, Number(req.query.start || 0) || 0);
       const audioTrack = Math.max(0, Number(req.query.audioTrack || 0) || 0);
+      const loopbackUrl = handle.localFilePath
+        ? undefined
+        : `http://127.0.0.1:${PORT}/api/stream/${encodeURIComponent(req.params.infoHash)}/${fileIndex}`;
+
+      torrentManager.updateTranscodeTelemetry(req.params.infoHash, {
+        active: true,
+        quality,
+        startSeconds,
+        fps: 0,
+        speed: 'starting',
+        encodedSeconds: 0,
+      });
+      torrentManager.recordEvent(
+        req.params.infoHash,
+        'transcoder',
+        startSeconds > 0
+          ? `FFmpeg seeked live transcode to ${formatDuration(startSeconds)}`
+          : `FFmpeg live transcode started (${quality})`,
+        `H.264 + AAC fragmented MP4 · audio track #${audioTrack + 1}`
+      );
 
       streamTranscodedMp4({
         req,
         res,
         filePath: handle.localFilePath,
-        inputStream: handle.localFilePath ? undefined : handle.createReadStream(),
+        inputUrl: loopbackUrl,
         quality,
         startSeconds,
         audioTrack,
+        onProgress: (stats) => {
+          torrentManager.updateTranscodeTelemetry(req.params.infoHash, {
+            active: true,
+            fps: stats.fps,
+            speed: stats.speed,
+            encodedSeconds: stats.encodedSeconds,
+          });
+        },
+        onEnd: () => {
+          torrentManager.updateTranscodeTelemetry(req.params.infoHash, {
+            active: false,
+          });
+        },
       });
     } catch (err) {
       if (!res.headersSent) {

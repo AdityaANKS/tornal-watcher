@@ -118,3 +118,50 @@ export interface FileTreeNode {
   file?: TorrentFileItem;
   children: FileTreeNode[];
 }
+
+export interface PipelineEvent {
+  id: string;
+  timestamp: string;
+  stage: 'swarm' | 'server' | 'transcoder' | 'browser';
+  message: string;
+  detail?: string;
+}
+
+export interface ActiveTranscodeInfo {
+  active: boolean;
+  quality: TranscodeQuality;
+  startSeconds: number;
+  fps: number;
+  speed: string;
+  encodedSeconds: number;
+}
+
+export interface PipelineSnapshot {
+  infoHash: string;
+  cacheBytes: number;
+  totalBytes: number;
+  cachePercent: number;
+  verifiedPieces: number;
+  totalPieces: number;
+  pieceLength: number;
+  pieceBuckets: number[];
+  activeHttpStreams: number;
+  lastRangeBytes: string | null;
+  transcode: ActiveTranscodeInfo;
+  events: PipelineEvent[];
+}
+
+export interface PlayerPlaybackTelemetry {
+  isPlaying: boolean;
+  isBuffering: boolean;
+  hasStarted: boolean;
+  currentTime: number;
+  duration: number;
+  bufferAheadSeconds: number;
+  bufferedEndSeconds: number;
+  engineMode: 'direct' | 'transcode';
+  transportLabel: 'HTTP 206 Range' | 'FFmpeg HLS' | 'FFmpeg Live fMP4';
+  quality: TranscodeQuality;
+  seekOffset: number;
+}
+

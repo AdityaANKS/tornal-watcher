@@ -144,7 +144,7 @@ export function getSampleDescriptors(): LocalSampleTorrent[] {
       infoHash: ALPINE_HASH,
       name: 'Alpine Dusk (720p Direct MP4 Sample)',
       magnetURI: `magnet:?xt=urn:btih:${ALPINE_HASH}&dn=Alpine+Dusk+720p+H264+AAC`,
-      posterUrl: '/src/assets/images/poster_alpine_reel_1795109499817.jpg',
+      posterUrl: '/src/assets/images/poster_alpine_reel_1795356637256.jpg',
       addedAt: '2026-11-18T18:00:00.000Z',
       files: [
         {
@@ -163,7 +163,7 @@ export function getSampleDescriptors(): LocalSampleTorrent[] {
       infoHash: TRANSIT_HASH,
       name: 'Midnight Transit (720p MKV Transcode Sample)',
       magnetURI: `magnet:?xt=urn:btih:${TRANSIT_HASH}&dn=Midnight+Transit+720p+x264+MKV`,
-      posterUrl: '/src/assets/images/poster_noir_transit_1795109512549.jpg',
+      posterUrl: '/src/assets/images/poster_noir_transit_1795356640577.jpg',
       addedAt: '2026-11-19T08:30:00.000Z',
       files: [
         {
@@ -203,11 +203,11 @@ export function ensureSampleMediaReady(): Promise<LocalSampleTorrent[]> {
 
     const alpinePoster = path.resolve(
       process.cwd(),
-      'src/assets/images/poster_alpine_reel_1795109499817.jpg'
+      'src/assets/images/poster_alpine_reel_1795356637256.jpg'
     );
     const transitPoster = path.resolve(
       process.cwd(),
-      'src/assets/images/poster_noir_transit_1795109512549.jpg'
+      'src/assets/images/poster_noir_transit_1795356640577.jpg'
     );
 
     await Promise.all([

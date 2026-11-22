@@ -354,3 +354,73 @@ export function formatDuration(seconds: number): string {
   }
   return `${mins}:${String(secs).padStart(2, '0')}`;
 }
+
+/**
+ * Resolves the true full video duration.
+ * Live fragmented MP4 transcodes expose only buffered seconds via video.duration
+ * (e.g. 0:10 on a 24:00 episode), so ffprobe's container duration takes precedence.
+ */
+export function resolveEffectiveDuration(
+  videoDuration: number,
+  probeDuration: number,
+  isLiveFragmented: boolean
+): number {
+  const safeVideo = Number.isFinite(videoDuration) && videoDuration > 0 ? videoDuration : 0;
+  const safeProbe = Number.isFinite(probeDuration) && probeDuration > 0 ? probeDuration : 0;
+
+  if (isLiveFragmented) {
+    if (safeProbe > 0) return Math.max(safeProbe, safeVideo);
+    return safeVideo;
+  }
+
+  if (safeProbe > 0 && safeVideo > 0) {
+    // Prefer the larger value if the browser reports a partial/growing duration
+    return Math.max(safeProbe, safeVideo);
+  }
+  return safeProbe || safeVideo;
+}
+
+export function computeBufferAhead(
+  currentTime: number,
+  ranges: Array<{ start: number; end: number }>
+): { aheadSeconds: number; bufferedEnd: number } {
+  if (!ranges.length || !Number.isFinite(currentTime)) {
+    return { aheadSeconds: 0, bufferedEnd: 0 };
+  }
+
+  let maxEnd = 0;
+  let activeAhead = 0;
+
+  for (const r of ranges) {
+    if (r.end > maxEnd) maxEnd = r.end;
+    if (currentTime >= r.start - 0.5 && currentTime <= r.end) {
+      activeAhead = Math.max(activeAhead, r.end - currentTime);
+    }
+  }
+
+  return {
+    aheadSeconds: Number(Math.max(0, activeAhead).toFixed(1)),
+    bufferedEnd: Number(Math.max(0, maxEnd).toFixed(2)),
+  };
+}
+
+export function buildPieceMapBuckets(pieceFlags: boolean[], bucketCount = 48): number[] {
+  const safeBuckets = Math.max(1, bucketCount);
+  if (pieceFlags.length === 0) {
+    return new Array<number>(safeBuckets).fill(0);
+  }
+
+  const result: number[] = [];
+  for (let b = 0; b < safeBuckets; b++) {
+    const start = Math.floor((b * pieceFlags.length) / safeBuckets);
+    const end = Math.max(start + 1, Math.floor(((b + 1) * pieceFlags.length) / safeBuckets));
+    let done = 0;
+    const total = Math.min(pieceFlags.length, end) - start;
+    for (let i = start; i < Math.min(pieceFlags.length, end); i++) {
+      if (pieceFlags[i]) done++;
+    }
+    result.push(total > 0 ? Number((done / total).toFixed(2)) : 0);
+  }
+  return result;
+}
+

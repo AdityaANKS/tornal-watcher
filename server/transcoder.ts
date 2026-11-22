@@ -56,16 +56,30 @@ function parseFrameRate(raw?: string): string {
   return Number.isInteger(val) ? String(val) : val.toFixed(2);
 }
 
-export async function probeLocalFile(
-  filePath: string,
+export async function probeMediaSource(
+  inputSource: string,
+  originalFilename: string,
   infoHash: string,
   fileIndex: number
 ): Promise<MediaProbeInfo> {
-  const { stdout } = await execFileAsync(
-    'ffprobe',
-    ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath],
-    { timeout: 10_000 }
-  );
+  const isHttp = inputSource.startsWith('http://') || inputSource.startsWith('https://');
+  const args = [
+    '-v',
+    'quiet',
+    '-print_format',
+    'json',
+    '-analyzeduration',
+    '10000000',
+    '-probesize',
+    '10000000',
+    '-show_format',
+    '-show_streams',
+    inputSource,
+  ];
+
+  const { stdout } = await execFileAsync('ffprobe', args, {
+    timeout: isHttp ? 25_000 : 12_000,
+  });
 
   const parsed = JSON.parse(stdout) as FfprobeOutput;
   const streams = parsed.streams ?? [];
@@ -74,7 +88,7 @@ export async function probeLocalFile(
   const subStreams = streams.filter((s) => s.codec_type === 'subtitle');
 
   const formatName = parsed.format?.format_name ?? 'unknown';
-  const ext = path.extname(filePath).toLowerCase();
+  const ext = path.extname(originalFilename || inputSource).toLowerCase();
   const videoCodec = (videoStream?.codec_name ?? 'unknown').toLowerCase();
   const primaryAudioCodec = (audioStreams[0]?.codec_name ?? 'aac').toLowerCase();
 
@@ -111,8 +125,12 @@ export async function probeLocalFile(
     url: `/api/subtitles/embedded/${infoHash}/${fileIndex}/${stream.index}`,
   }));
 
+  // Fall back to stream duration if format duration is absent
+  const formatDuration = Number(parsed.format?.duration ?? 0) || 0;
+  const streamDuration = Number((videoStream as { duration?: string } | undefined)?.duration ?? 0) || 0;
+
   return {
-    duration: Number(parsed.format?.duration ?? 0) || 0,
+    duration: formatDuration || streamDuration,
     formatName,
     bitRate: Number(parsed.format?.bit_rate ?? 0) || 0,
     videoCodec: videoCodec.toUpperCase(),
@@ -124,6 +142,14 @@ export async function probeLocalFile(
     browserCompatible,
     recommendedMode: browserCompatible ? 'direct' : 'transcode',
   };
+}
+
+export async function probeLocalFile(
+  filePath: string,
+  infoHash: string,
+  fileIndex: number
+): Promise<MediaProbeInfo> {
+  return probeMediaSource(filePath, path.basename(filePath), infoHash, fileIndex);
 }
 
 function getScaleFilter(quality: TranscodeQuality): string | null {
@@ -139,25 +165,46 @@ function getScaleFilter(quality: TranscodeQuality): string | null {
   }
 }
 
+function parseFfmpegTimeToSeconds(raw: string): number {
+  const parts = raw.split(':').map(Number);
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return 0;
+  return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
 export function streamTranscodedMp4(options: {
   req: Request;
   res: Response;
   filePath?: string;
+  inputUrl?: string;
   inputStream?: Readable;
   quality: TranscodeQuality;
   startSeconds?: number;
   audioTrack?: number;
+  onProgress?: (stats: { fps: number; speed: string; encodedSeconds: number }) => void;
+  onEnd?: () => void;
 }): void {
-  const { req, res, filePath, inputStream, quality, startSeconds = 0, audioTrack = 0 } = options;
+  const {
+    req,
+    res,
+    filePath,
+    inputUrl,
+    inputStream,
+    quality,
+    startSeconds = 0,
+    audioTrack = 0,
+    onProgress,
+    onEnd,
+  } = options;
 
-  const args: string[] = ['-hide_banner', '-loglevel', 'error'];
+  const seekableInput = filePath || inputUrl;
+  const args: string[] = ['-hide_banner', '-loglevel', 'warning', '-stats', '-stats_period', '0.5'];
 
-  if (filePath && startSeconds > 0) {
+  if (seekableInput && startSeconds > 0) {
     args.push('-ss', String(startSeconds));
   }
 
-  if (filePath) {
-    args.push('-i', filePath);
+  if (seekableInput) {
+    args.push('-i', seekableInput);
   } else {
     args.push('-i', 'pipe:0');
   }
@@ -200,7 +247,7 @@ export function streamTranscodedMp4(options: {
 
   const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
-  if (inputStream && ffmpeg.stdin) {
+  if (!seekableInput && inputStream && ffmpeg.stdin) {
     inputStream.pipe(ffmpeg.stdin);
     inputStream.on('error', () => {
       ffmpeg.kill('SIGKILL');
@@ -214,10 +261,31 @@ export function streamTranscodedMp4(options: {
 
   let stderrBuf = '';
   ffmpeg.stderr.on('data', (chunk: Buffer) => {
-    stderrBuf += chunk.toString('utf-8');
+    const text = chunk.toString('utf-8');
+    stderrBuf = (stderrBuf + text).slice(-2000);
+    if (onProgress) {
+      const fpsMatch = /fps=\s*([\d.]+)/.exec(text);
+      const timeMatch = /time=(\d{2}:\d{2}:\d{2}\.\d+)/.exec(text);
+      const speedMatch = /speed=\s*([\d.]+x)/.exec(text);
+      if (fpsMatch || timeMatch || speedMatch) {
+        onProgress({
+          fps: fpsMatch ? Math.round(Number(fpsMatch[1])) : 0,
+          speed: speedMatch ? speedMatch[1] : '1.0x',
+          encodedSeconds: timeMatch ? Math.round(parseFfmpegTimeToSeconds(timeMatch[1])) : 0,
+        });
+      }
+    }
   });
 
+  let ended = false;
+  const finish = () => {
+    if (ended) return;
+    ended = true;
+    onEnd?.();
+  };
+
   ffmpeg.on('error', () => {
+    finish();
     if (!res.headersSent) {
       res.status(500).json({ error: 'FFmpeg failed to start transcoding.' });
     } else {
@@ -226,12 +294,14 @@ export function streamTranscodedMp4(options: {
   });
 
   ffmpeg.on('close', (code) => {
+    finish();
     if (code !== 0 && code !== null && !res.headersSent) {
       res.status(500).json({ error: stderrBuf.trim() || 'Transcoding failed.' });
     }
   });
 
   req.on('close', () => {
+    finish();
     if (inputStream && 'destroy' in inputStream && typeof inputStream.destroy === 'function') {
       inputStream.destroy();
     }

@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildFileTree,
+  buildPieceMapBuckets,
   classifyMediaFile,
+  computeBufferAhead,
   convertSrtToVtt,
   extractReleaseMeta,
   formatBytes,
@@ -10,6 +12,7 @@ import {
   formatSpeed,
   parseMagnetOrHash,
   pickPrimaryVideoFile,
+  resolveEffectiveDuration,
 } from './torrentHelpers';
 import type { TorrentFileItem } from '../types/torrent';
 
@@ -129,5 +132,30 @@ test('formatters output clean human-readable tabular units', () => {
   assert.equal(formatBytes(1024 * 1024 * 12.5), '12.5 MB');
   assert.equal(formatSpeed(1024 * 1024 * 4.2), '4.2 MB/s');
   assert.equal(formatDuration(65), '1:05');
+  assert.equal(formatDuration(1440), '24:00');
   assert.equal(formatDuration(3661), '1:01:01');
+});
+
+test('resolveEffectiveDuration preserves full 24-min probe duration over 10s fragmented MP4 buffer', () => {
+  // 24 min = 1440s probed, browser fragmented MP4 reports only 10s buffered
+  assert.equal(resolveEffectiveDuration(10, 1440, true), 1440);
+  // Infinity browser duration on live stream falls back to probe duration
+  assert.equal(resolveEffectiveDuration(Infinity, 1440, true), 1440);
+  // Direct play where probe hasn't finished yet still uses video.duration
+  assert.equal(resolveEffectiveDuration(1445, 0, false), 1445);
+});
+
+test('computeBufferAhead calculates exact buffered seconds ahead of playhead', () => {
+  const res = computeBufferAhead(120, [
+    { start: 0, end: 30 },
+    { start: 100, end: 156.4 },
+  ]);
+  assert.equal(res.aheadSeconds, 36.4);
+  assert.equal(res.bufferedEnd, 156.4);
+});
+
+test('buildPieceMapBuckets maps torrent piece flags into normalized density buckets', () => {
+  const flags = [true, true, true, true, false, false, false, false];
+  const buckets = buildPieceMapBuckets(flags, 4);
+  assert.deepEqual(buckets, [1, 1, 0, 0]);
 });
