@@ -1,0 +1,6 @@
+{
+  "name": "StreamTor",
+  "description": "Private browser-based torrent video streaming server with sequential HTTP range streaming, on-the-fly FFmpeg transcoding, and subtitle support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
